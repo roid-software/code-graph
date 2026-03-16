@@ -217,15 +217,29 @@ def analyze_js(filepath: str, rel_path: str) -> dict:
         ln = source[:m.start()].count("\n") + 1
         imports.append({"module": m.group(1), "line": ln})
 
-    # Simple call extraction (top-level only, skip noise)
+    # Call extraction with caller context
     noise = {"if", "for", "while", "switch", "catch", "return", "throw", "new", "typeof", "instanceof", "import", "export", "require", "console"}
-    func_names = {f["name"] for f in functions}
+    # Build line→function mapping
+    func_ranges = sorted(functions, key=lambda f: f["line"])
+    def _find_js_caller(ln: int) -> str | None:
+        best = None
+        for f in func_ranges:
+            if f["line"] <= ln:
+                best = f["qualified_name"]
+            else:
+                break
+        return best
+
     for m in _JS_CALL.finditer(source):
         callee = m.group(1)
         base = callee.split(".")[0]
         if base not in noise and len(callee) < 60:
             ln = source[:m.start()].count("\n") + 1
-            calls.append({"callee": callee, "line": ln})
+            caller = _find_js_caller(ln)
+            entry = {"callee": callee, "line": ln}
+            if caller:
+                entry["caller"] = caller
+            calls.append(entry)
 
     return {
         "file": rel_path,
@@ -252,97 +266,160 @@ _RB_BEFORE = re.compile(r"^\s*(before_action|after_action|around_action|before_f
 
 
 def analyze_rb(filepath: str, rel_path: str) -> dict:
+    """Line-by-line Ruby analyzer that tracks method scope for call graph edges."""
     try:
         with open(filepath, "r", errors="replace") as f:
             source = f.read()
     except Exception:
         return {"file": rel_path, "language": "ruby", "functions": [], "classes": [], "imports": [], "calls": [], "lines": 0}
 
-    lines = source.split("\n")
+    source_lines = source.split("\n")
     functions = []
     classes = []
     imports = []
     calls = []
     associations = []
-    current_class = None
 
-    for m in _RB_CLASS.finditer(source):
-        ln = source[:m.start()].count("\n") + 1
-        current_class = m.group(1)
-        classes.append({
-            "name": m.group(1),
-            "bases": [m.group(2)] if m.group(2) else [],
-            "line": ln,
-            "methods": [],
-            "associations": [],
-            "scopes": [],
-        })
+    # Track nesting via def/end balance
+    current_class: str | None = None
+    current_method: str | None = None
+    class_stack: list[str] = []
+    method_stack: list[str] = []
+    # Simple indent/end tracker for scope
+    scope_stack: list[str] = []  # "class", "module", "def", "block"
 
-    for m in _RB_MODULE.finditer(source):
-        ln = source[:m.start()].count("\n") + 1
-        classes.append({
-            "name": m.group(1),
-            "bases": [],
-            "line": ln,
-            "kind": "module",
-            "methods": [],
-        })
+    noise = {"if", "unless", "while", "until", "case", "when", "return", "raise",
+             "puts", "print", "require", "require_relative", "include", "extend",
+             "prepend", "attr_accessor", "attr_reader", "attr_writer", "rescue",
+             "lambda", "proc", "loop", "begin", "ensure", "yield", "super"}
 
-    for m in _RB_DEF.finditer(source):
-        ln = source[:m.start()].count("\n") + 1
-        is_class_method = bool(m.group(1))
-        name = m.group(2)
-        params_raw = m.group(3) or ""
-        qualified = f"{current_class}.{name}" if current_class else name
-        functions.append({
-            "name": name,
-            "qualified_name": qualified,
-            "line": ln,
-            "params_raw": params_raw.strip(),
-            "is_class_method": is_class_method,
-            "class": current_class,
-        })
-        # Add to class methods list
-        for c in classes:
-            if c["name"] == current_class:
-                c["methods"].append(name)
-                break
+    re_end = re.compile(r"^\s*end\b")
+    re_block_open = re.compile(r"\b(do)\s*(\|[^|]*\|)?\s*$")
+    # Inline block openers that also need end tracking
+    re_inline_scope = re.compile(r"^\s*(if|unless|while|until|case|begin)\b(?!.*\bthen\b.*\bend\b)")
 
-    for m in _RB_REQUIRE.finditer(source):
-        ln = source[:m.start()].count("\n") + 1
-        imports.append({"module": m.group(1), "line": ln})
+    for lineno, line in enumerate(source_lines, 1):
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
 
-    for m in _RB_INCLUDE.finditer(source):
-        ln = source[:m.start()].count("\n") + 1
-        imports.append({"module": m.group(1), "line": ln, "kind": "mixin"})
+        # ── Class / Module ──
+        m = _RB_CLASS.match(line)
+        if m:
+            current_class = m.group(1)
+            class_stack.append(current_class)
+            scope_stack.append("class")
+            classes.append({
+                "name": m.group(1),
+                "bases": [m.group(2)] if m.group(2) else [],
+                "line": lineno,
+                "methods": [],
+                "associations": [],
+                "scopes": [],
+            })
+            continue
 
-    # Rails associations
-    for m in _RB_HAS.finditer(source):
-        ln = source[:m.start()].count("\n") + 1
-        associations.append({"type": m.group(1), "name": m.group(2), "line": ln})
-        for c in classes:
-            if c["name"] == current_class and "associations" in c:
-                c["associations"].append(f"{m.group(1)} :{m.group(2)}")
-                break
+        m = _RB_MODULE.match(line)
+        if m:
+            current_class = m.group(1)
+            class_stack.append(current_class)
+            scope_stack.append("module")
+            continue
 
-    # Scopes
-    for m in _RB_SCOPE.finditer(source):
-        for c in classes:
-            if c["name"] == current_class and "scopes" in c:
-                c["scopes"].append(m.group(1))
-                break
+        # ── Method def ──
+        m = _RB_DEF.match(line)
+        if m:
+            is_class_method = bool(m.group(1))
+            name = m.group(2)
+            params_raw = m.group(3) or ""
+            qualified = f"{current_class}.{name}" if current_class else name
+            current_method = qualified
+            method_stack.append(qualified)
+            scope_stack.append("def")
+            functions.append({
+                "name": name,
+                "qualified_name": qualified,
+                "line": lineno,
+                "params_raw": params_raw.strip(),
+                "is_class_method": is_class_method,
+                "class": current_class,
+            })
+            for c in classes:
+                if c["name"] == current_class:
+                    c["methods"].append(name)
+                    break
+            # Don't continue — the line might also contain a call
 
-    # Callbacks
-    for m in _RB_BEFORE.finditer(source):
-        calls.append({"callee": m.group(2), "line": source[:m.start()].count("\n") + 1, "kind": m.group(1)})
+        # ── end ──
+        if re_end.match(line):
+            if scope_stack:
+                popped = scope_stack.pop()
+                if popped == "def":
+                    if method_stack:
+                        method_stack.pop()
+                    current_method = method_stack[-1] if method_stack else None
+                elif popped in ("class", "module"):
+                    if class_stack:
+                        class_stack.pop()
+                    current_class = class_stack[-1] if class_stack else None
+            continue
 
-    # Method calls
-    noise = {"if", "unless", "while", "until", "case", "when", "return", "raise", "puts", "print", "require", "require_relative", "include", "extend", "prepend", "attr_accessor", "attr_reader", "attr_writer"}
-    for m in _RB_CALL.finditer(source):
-        callee = m.group(1)
-        if callee.split(".")[0] not in noise and len(callee) < 60:
-            ln = source[:m.start()].count("\n") + 1
-            calls.append({"callee": callee, "line": ln})
+        # ── Track block/if/etc scope for end matching ──
+        if re_block_open.search(line) and not _RB_DEF.match(line):
+            scope_stack.append("block")
+        elif re_inline_scope.match(line):
+            # Only count if this isn't a single-line if/unless (modifier form)
+            # Modifier form: `return x if cond` — no end needed
+            # Block form: `if cond` on its own line — needs end
+            if not re.match(r"^\s*(if|unless)\b", stripped):
+                pass  # modifier form, no scope push
+            else:
+                scope_stack.append("block")
+
+        # ── Requires / Includes ──
+        m = _RB_REQUIRE.match(line)
+        if m:
+            imports.append({"module": m.group(1), "line": lineno})
+            continue
+
+        m = _RB_INCLUDE.match(line)
+        if m:
+            imports.append({"module": m.group(1), "line": lineno, "kind": "mixin"})
+            continue
+
+        # ── Rails associations ──
+        m = _RB_HAS.match(line)
+        if m:
+            associations.append({"type": m.group(1), "name": m.group(2), "line": lineno})
+            for c in classes:
+                if c["name"] == current_class and "associations" in c:
+                    c["associations"].append(f"{m.group(1)} :{m.group(2)}")
+                    break
+            continue
+
+        # ── Scopes ──
+        m = _RB_SCOPE.match(line)
+        if m:
+            for c in classes:
+                if c["name"] == current_class and "scopes" in c:
+                    c["scopes"].append(m.group(1))
+                    break
+            continue
+
+        # ── Callbacks (class-level calls) ──
+        m = _RB_BEFORE.match(line)
+        if m:
+            caller_ctx = current_class or rel_path
+            calls.append({"caller": caller_ctx, "callee": m.group(2), "line": lineno, "kind": m.group(1)})
+            continue
+
+        # ── Method calls — attributed to current_method ──
+        for m in _RB_CALL.finditer(line):
+            callee = m.group(1)
+            base = callee.split(".")[0]
+            if base not in noise and len(callee) < 80:
+                caller_ctx = current_method or current_class or rel_path
+                calls.append({"caller": caller_ctx, "callee": callee, "line": lineno})
 
     return {
         "file": rel_path,
@@ -352,7 +429,7 @@ def analyze_rb(filepath: str, rel_path: str) -> dict:
         "imports": imports,
         "calls": calls,
         "associations": associations,
-        "lines": len(lines),
+        "lines": len(source_lines),
     }
 
 
@@ -435,6 +512,43 @@ def scan_project(project_dir: str, excludes: set[str] = None) -> dict:
 
 # ── Query Engine ──
 
+def _graph_lookup(graph: dict, name: str) -> list:
+    """Look up a name in the call/reverse graph with fuzzy matching.
+
+    Priority: exact match → unqualified match → case-insensitive suffix match.
+    Merges results from all matching keys.
+    """
+    # 1. Exact match
+    if name in graph:
+        return graph[name]
+
+    # 2. Try unqualified: "Offer.validate_conditions" → also check "validate_conditions"
+    short = name.split(".")[-1] if "." in name else None
+    results = []
+
+    # 3. Collect all matching keys (case-insensitive, suffix match)
+    name_lower = name.lower()
+    short_lower = short.lower() if short else None
+    for key, values in graph.items():
+        key_lower = key.lower()
+        if key_lower == name_lower:
+            results.extend(values)
+        elif short_lower and key_lower == short_lower:
+            results.extend(values)
+        elif key_lower.endswith(f".{name_lower}") or (short_lower and key_lower.endswith(f".{short_lower}")):
+            results.extend(values)
+
+    # Deduplicate by (caller/callee + file + line)
+    seen = set()
+    deduped = []
+    for r in results:
+        key = (r.get("caller", r.get("callee", "")), r.get("file", ""), r.get("line", 0))
+        if key not in seen:
+            seen.add(key)
+            deduped.append(r)
+    return deduped
+
+
 def query(cache: dict, args: list[str]) -> Any:
     cmd = args[0] if args else "stats"
 
@@ -460,13 +574,13 @@ def query(cache: dict, args: list[str]) -> Any:
 
     if cmd == "calls" and len(args) > 1:
         name = args[1]
-        # What does `name` call?
-        return cache["call_graph"].get(name, [])
+        # What does `name` call? Try exact, then fuzzy.
+        return _graph_lookup(cache["call_graph"], name)
 
     if cmd == "callers" and len(args) > 1:
         name = args[1]
-        # Who calls `name`?
-        return cache["reverse_graph"].get(name, [])
+        # Who calls `name`? Try exact, then fuzzy.
+        return _graph_lookup(cache["reverse_graph"], name)
 
     if cmd == "file" and len(args) > 1:
         target = args[1]
