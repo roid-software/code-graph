@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Build AST summary + call graph for a project. Outputs JSON cache.
 
-Supports: Python (.py), JavaScript/TypeScript (.js/.jsx/.ts/.tsx)
+Supports: Python (.py), JavaScript/TypeScript (.js/.jsx/.ts/.tsx), Ruby (.rb)
 
 Usage:
     python3 analyze.py <project_dir> [--output <cache.json>] [--exclude <pattern>...]
@@ -34,7 +34,8 @@ DEFAULT_EXCLUDES = {
 
 PY_EXTS = {".py"}
 JS_EXTS = {".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs"}
-ALL_EXTS = PY_EXTS | JS_EXTS
+RB_EXTS = {".rb"}
+ALL_EXTS = PY_EXTS | JS_EXTS | RB_EXTS
 
 
 # ── Python AST Analyzer ──
@@ -237,6 +238,124 @@ def analyze_js(filepath: str, rel_path: str) -> dict:
     }
 
 
+# ── Ruby Analyzer (regex-based) ──
+
+_RB_CLASS = re.compile(r"^\s*class\s+(\w+)(?:\s*<\s*([\w:]+))?", re.MULTILINE)
+_RB_MODULE = re.compile(r"^\s*module\s+([\w:]+)", re.MULTILINE)
+_RB_DEF = re.compile(r"^\s*def\s+(self\.)?(\w+[?!=]?)\s*(?:\(([^)]*)\))?", re.MULTILINE)
+_RB_REQUIRE = re.compile(r"^\s*require(?:_relative)?\s+['\"]([^'\"]+)['\"]", re.MULTILINE)
+_RB_INCLUDE = re.compile(r"^\s*(?:include|extend|prepend)\s+([\w:]+)", re.MULTILINE)
+_RB_CALL = re.compile(r"(\w+(?:\.\w+)*)\s*[\(]", re.MULTILINE)
+_RB_HAS = re.compile(r"^\s*(has_many|has_one|belongs_to|has_and_belongs_to_many)\s+:(\w+)", re.MULTILINE)
+_RB_SCOPE = re.compile(r"^\s*scope\s+:(\w+)", re.MULTILINE)
+_RB_BEFORE = re.compile(r"^\s*(before_action|after_action|around_action|before_filter|after_filter)\s+:(\w+)", re.MULTILINE)
+
+
+def analyze_rb(filepath: str, rel_path: str) -> dict:
+    try:
+        with open(filepath, "r", errors="replace") as f:
+            source = f.read()
+    except Exception:
+        return {"file": rel_path, "language": "ruby", "functions": [], "classes": [], "imports": [], "calls": [], "lines": 0}
+
+    lines = source.split("\n")
+    functions = []
+    classes = []
+    imports = []
+    calls = []
+    associations = []
+    current_class = None
+
+    for m in _RB_CLASS.finditer(source):
+        ln = source[:m.start()].count("\n") + 1
+        current_class = m.group(1)
+        classes.append({
+            "name": m.group(1),
+            "bases": [m.group(2)] if m.group(2) else [],
+            "line": ln,
+            "methods": [],
+            "associations": [],
+            "scopes": [],
+        })
+
+    for m in _RB_MODULE.finditer(source):
+        ln = source[:m.start()].count("\n") + 1
+        classes.append({
+            "name": m.group(1),
+            "bases": [],
+            "line": ln,
+            "kind": "module",
+            "methods": [],
+        })
+
+    for m in _RB_DEF.finditer(source):
+        ln = source[:m.start()].count("\n") + 1
+        is_class_method = bool(m.group(1))
+        name = m.group(2)
+        params_raw = m.group(3) or ""
+        qualified = f"{current_class}.{name}" if current_class else name
+        functions.append({
+            "name": name,
+            "qualified_name": qualified,
+            "line": ln,
+            "params_raw": params_raw.strip(),
+            "is_class_method": is_class_method,
+            "class": current_class,
+        })
+        # Add to class methods list
+        for c in classes:
+            if c["name"] == current_class:
+                c["methods"].append(name)
+                break
+
+    for m in _RB_REQUIRE.finditer(source):
+        ln = source[:m.start()].count("\n") + 1
+        imports.append({"module": m.group(1), "line": ln})
+
+    for m in _RB_INCLUDE.finditer(source):
+        ln = source[:m.start()].count("\n") + 1
+        imports.append({"module": m.group(1), "line": ln, "kind": "mixin"})
+
+    # Rails associations
+    for m in _RB_HAS.finditer(source):
+        ln = source[:m.start()].count("\n") + 1
+        associations.append({"type": m.group(1), "name": m.group(2), "line": ln})
+        for c in classes:
+            if c["name"] == current_class and "associations" in c:
+                c["associations"].append(f"{m.group(1)} :{m.group(2)}")
+                break
+
+    # Scopes
+    for m in _RB_SCOPE.finditer(source):
+        for c in classes:
+            if c["name"] == current_class and "scopes" in c:
+                c["scopes"].append(m.group(1))
+                break
+
+    # Callbacks
+    for m in _RB_BEFORE.finditer(source):
+        calls.append({"callee": m.group(2), "line": source[:m.start()].count("\n") + 1, "kind": m.group(1)})
+
+    # Method calls
+    noise = {"if", "unless", "while", "until", "case", "when", "return", "raise", "puts", "print", "require", "require_relative", "include", "extend", "prepend", "attr_accessor", "attr_reader", "attr_writer"}
+    for m in _RB_CALL.finditer(source):
+        callee = m.group(1)
+        if callee.split(".")[0] not in noise and len(callee) < 60:
+            ln = source[:m.start()].count("\n") + 1
+            calls.append({"callee": callee, "line": ln})
+
+    return {
+        "file": rel_path,
+        "language": "ruby",
+        "functions": functions,
+        "classes": classes,
+        "imports": imports,
+        "calls": calls,
+        "associations": associations,
+        "lines": len(lines),
+    }
+
+
 # ── Project Scanner ──
 
 def scan_project(project_dir: str, excludes: set[str] = None) -> dict:
@@ -245,7 +364,7 @@ def scan_project(project_dir: str, excludes: set[str] = None) -> dict:
     files: list[dict] = []
     all_calls = []
     all_imports = []
-    stats = {"py_files": 0, "js_files": 0, "total_lines": 0, "total_functions": 0, "total_classes": 0}
+    stats = {"py_files": 0, "js_files": 0, "rb_files": 0, "total_lines": 0, "total_functions": 0, "total_classes": 0}
 
     for dirpath, dirnames, filenames in os.walk(root):
         dirnames[:] = [d for d in dirnames if d not in excludes]
@@ -262,6 +381,9 @@ def scan_project(project_dir: str, excludes: set[str] = None) -> dict:
             elif ext in JS_EXTS:
                 result = analyze_js(str(fpath), rel)
                 stats["js_files"] += 1
+            elif ext in RB_EXTS:
+                result = analyze_rb(str(fpath), rel)
+                stats["rb_files"] += 1
             else:
                 continue
 
