@@ -1,0 +1,428 @@
+#!/usr/bin/env python3
+"""Build AST summary + call graph for a project. Outputs JSON cache.
+
+Supports: Python (.py), JavaScript/TypeScript (.js/.jsx/.ts/.tsx)
+
+Usage:
+    python3 analyze.py <project_dir> [--output <cache.json>] [--exclude <pattern>...]
+    python3 analyze.py <project_dir> --query functions          # list all functions
+    python3 analyze.py <project_dir> --query calls <func_name>  # who calls func?
+    python3 analyze.py <project_dir> --query callers <func_name> # who does func call?
+    python3 analyze.py <project_dir> --query file <path>        # file summary
+    python3 analyze.py <project_dir> --query imports            # import graph
+    python3 analyze.py <project_dir> --query classes            # all classes
+    python3 analyze.py <project_dir> --query stats              # project stats
+"""
+
+import ast
+import json
+import os
+import re
+import sys
+import hashlib
+from pathlib import Path
+from collections import defaultdict
+from typing import Any
+
+# ── Config ──
+
+DEFAULT_EXCLUDES = {
+    "node_modules", ".git", "__pycache__", ".venv", "venv", "env",
+    "dist", "build", ".next", ".nuxt", "coverage", ".tox", "eggs",
+    ".mypy_cache", ".pytest_cache", ".ruff_cache",
+}
+
+PY_EXTS = {".py"}
+JS_EXTS = {".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs"}
+ALL_EXTS = PY_EXTS | JS_EXTS
+
+
+# ── Python AST Analyzer ──
+
+class PyAnalyzer(ast.NodeVisitor):
+    def __init__(self, filepath: str, rel_path: str):
+        self.filepath = filepath
+        self.rel_path = rel_path
+        self.functions: list[dict] = []
+        self.classes: list[dict] = []
+        self.imports: list[dict] = []
+        self.calls: list[dict] = []
+        self._current_func: str | None = None
+        self._current_class: str | None = None
+
+    def visit_Import(self, node):
+        for alias in node.names:
+            self.imports.append({"module": alias.name, "alias": alias.asname, "line": node.lineno})
+        self.generic_visit(node)
+
+    def visit_ImportFrom(self, node):
+        mod = node.module or ""
+        for alias in node.names:
+            self.imports.append({"module": f"{mod}.{alias.name}", "alias": alias.asname, "line": node.lineno})
+        self.generic_visit(node)
+
+    def visit_ClassDef(self, node):
+        bases = [self._name(b) for b in node.bases]
+        self.classes.append({
+            "name": node.name,
+            "bases": bases,
+            "line": node.lineno,
+            "end_line": getattr(node, "end_lineno", node.lineno),
+            "methods": [n.name for n in node.body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))],
+            "decorators": [self._name(d) for d in node.decorator_list],
+        })
+        old_class = self._current_class
+        self._current_class = node.name
+        self.generic_visit(node)
+        self._current_class = old_class
+
+    def visit_FunctionDef(self, node):
+        self._handle_func(node)
+
+    def visit_AsyncFunctionDef(self, node):
+        self._handle_func(node)
+
+    def _handle_func(self, node):
+        params = []
+        for arg in node.args.args:
+            params.append({
+                "name": arg.arg,
+                "annotation": self._name(arg.annotation) if arg.annotation else None,
+            })
+        ret = self._name(node.returns) if node.returns else None
+        qualified = f"{self._current_class}.{node.name}" if self._current_class else node.name
+
+        self.functions.append({
+            "name": node.name,
+            "qualified_name": qualified,
+            "line": node.lineno,
+            "end_line": getattr(node, "end_lineno", node.lineno),
+            "params": params,
+            "return_type": ret,
+            "decorators": [self._name(d) for d in node.decorator_list],
+            "is_async": isinstance(node, ast.AsyncFunctionDef),
+            "class": self._current_class,
+        })
+
+        old_func = self._current_func
+        self._current_func = qualified
+        self.generic_visit(node)
+        self._current_func = old_func
+
+    def visit_Call(self, node):
+        callee = self._name(node.func)
+        if callee and self._current_func:
+            self.calls.append({
+                "caller": self._current_func,
+                "callee": callee,
+                "line": node.lineno,
+            })
+        self.generic_visit(node)
+
+    def _name(self, node) -> str | None:
+        if node is None:
+            return None
+        if isinstance(node, ast.Name):
+            return node.id
+        if isinstance(node, ast.Attribute):
+            val = self._name(node.value)
+            return f"{val}.{node.attr}" if val else node.attr
+        if isinstance(node, ast.Subscript):
+            return self._name(node.value)
+        if isinstance(node, ast.Call):
+            return self._name(node.func)
+        if isinstance(node, ast.Constant):
+            return str(node.value)
+        return None
+
+    def analyze(self) -> dict:
+        try:
+            with open(self.filepath, "r", errors="replace") as f:
+                source = f.read()
+            tree = ast.parse(source, self.filepath)
+            self.visit(tree)
+        except SyntaxError:
+            pass
+        return {
+            "file": self.rel_path,
+            "language": "python",
+            "functions": self.functions,
+            "classes": self.classes,
+            "imports": self.imports,
+            "calls": self.calls,
+            "lines": source.count("\n") + 1 if "source" in dir() else 0,
+        }
+
+
+# ── JS/TS Analyzer (regex-based) ──
+
+_JS_FUNC = re.compile(
+    r"(?:export\s+)?(?:async\s+)?function\s+(\w+)\s*\(([^)]*)\)",
+    re.MULTILINE,
+)
+_JS_ARROW = re.compile(
+    r"(?:export\s+)?(?:const|let|var)\s+(\w+)\s*=\s*(?:async\s+)?\([^)]*\)\s*=>",
+    re.MULTILINE,
+)
+_JS_METHOD = re.compile(
+    r"(?:async\s+)?(\w+)\s*\([^)]*\)\s*\{",
+    re.MULTILINE,
+)
+_JS_CLASS = re.compile(
+    r"(?:export\s+)?class\s+(\w+)(?:\s+extends\s+(\w+))?",
+    re.MULTILINE,
+)
+_JS_IMPORT = re.compile(
+    r"import\s+(?:(?:\{[^}]*\}|\w+|\*\s+as\s+\w+)(?:\s*,\s*(?:\{[^}]*\}|\w+))*\s+from\s+)?['\"]([^'\"]+)['\"]",
+    re.MULTILINE,
+)
+_JS_REQUIRE = re.compile(
+    r"require\s*\(\s*['\"]([^'\"]+)['\"]\s*\)",
+    re.MULTILINE,
+)
+_JS_CALL = re.compile(r"(\w+(?:\.\w+)*)\s*\(", re.MULTILINE)
+
+
+def analyze_js(filepath: str, rel_path: str) -> dict:
+    try:
+        with open(filepath, "r", errors="replace") as f:
+            source = f.read()
+    except Exception:
+        return {"file": rel_path, "language": "javascript", "functions": [], "classes": [], "imports": [], "calls": [], "lines": 0}
+
+    lines = source.split("\n")
+    functions = []
+    classes = []
+    imports = []
+    calls = []
+
+    for m in _JS_FUNC.finditer(source):
+        ln = source[:m.start()].count("\n") + 1
+        functions.append({"name": m.group(1), "qualified_name": m.group(1), "line": ln, "params_raw": m.group(2).strip()})
+
+    for m in _JS_ARROW.finditer(source):
+        ln = source[:m.start()].count("\n") + 1
+        functions.append({"name": m.group(1), "qualified_name": m.group(1), "line": ln, "params_raw": ""})
+
+    for m in _JS_CLASS.finditer(source):
+        ln = source[:m.start()].count("\n") + 1
+        classes.append({"name": m.group(1), "bases": [m.group(2)] if m.group(2) else [], "line": ln})
+
+    for m in _JS_IMPORT.finditer(source):
+        ln = source[:m.start()].count("\n") + 1
+        imports.append({"module": m.group(1), "line": ln})
+
+    for m in _JS_REQUIRE.finditer(source):
+        ln = source[:m.start()].count("\n") + 1
+        imports.append({"module": m.group(1), "line": ln})
+
+    # Simple call extraction (top-level only, skip noise)
+    noise = {"if", "for", "while", "switch", "catch", "return", "throw", "new", "typeof", "instanceof", "import", "export", "require", "console"}
+    func_names = {f["name"] for f in functions}
+    for m in _JS_CALL.finditer(source):
+        callee = m.group(1)
+        base = callee.split(".")[0]
+        if base not in noise and len(callee) < 60:
+            ln = source[:m.start()].count("\n") + 1
+            calls.append({"callee": callee, "line": ln})
+
+    return {
+        "file": rel_path,
+        "language": "javascript",
+        "functions": functions,
+        "classes": classes,
+        "imports": imports,
+        "calls": calls,
+        "lines": len(lines),
+    }
+
+
+# ── Project Scanner ──
+
+def scan_project(project_dir: str, excludes: set[str] = None) -> dict:
+    root = Path(project_dir).resolve()
+    excludes = excludes or DEFAULT_EXCLUDES
+    files: list[dict] = []
+    all_calls = []
+    all_imports = []
+    stats = {"py_files": 0, "js_files": 0, "total_lines": 0, "total_functions": 0, "total_classes": 0}
+
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d not in excludes]
+        for fname in sorted(filenames):
+            fpath = Path(dirpath) / fname
+            ext = fpath.suffix.lower()
+            if ext not in ALL_EXTS:
+                continue
+            rel = str(fpath.relative_to(root))
+
+            if ext in PY_EXTS:
+                result = PyAnalyzer(str(fpath), rel).analyze()
+                stats["py_files"] += 1
+            elif ext in JS_EXTS:
+                result = analyze_js(str(fpath), rel)
+                stats["js_files"] += 1
+            else:
+                continue
+
+            stats["total_lines"] += result.get("lines", 0)
+            stats["total_functions"] += len(result.get("functions", []))
+            stats["total_classes"] += len(result.get("classes", []))
+
+            for c in result.get("calls", []):
+                c["file"] = rel
+            all_calls.extend(result.get("calls", []))
+
+            for imp in result.get("imports", []):
+                imp["file"] = rel
+            all_imports.extend(result.get("imports", []))
+
+            files.append(result)
+
+    # Build call graph index
+    call_graph = defaultdict(list)  # caller -> [callee]
+    reverse_graph = defaultdict(list)  # callee -> [caller]
+    for c in all_calls:
+        caller = c.get("caller", c.get("file", "?"))
+        callee = c["callee"]
+        call_graph[caller].append({"callee": callee, "file": c["file"], "line": c["line"]})
+        reverse_graph[callee].append({"caller": caller, "file": c["file"], "line": c["line"]})
+
+    # Build import graph
+    import_graph = defaultdict(list)
+    for imp in all_imports:
+        import_graph[imp["file"]].append(imp["module"])
+
+    # Hash for cache invalidation
+    h = hashlib.md5()
+    for f in files:
+        h.update(f["file"].encode())
+        h.update(str(f.get("lines", 0)).encode())
+    fingerprint = h.hexdigest()[:12]
+
+    return {
+        "project": str(root),
+        "fingerprint": fingerprint,
+        "stats": stats,
+        "files": files,
+        "call_graph": dict(call_graph),
+        "reverse_graph": dict(reverse_graph),
+        "import_graph": dict(import_graph),
+    }
+
+
+# ── Query Engine ──
+
+def query(cache: dict, args: list[str]) -> Any:
+    cmd = args[0] if args else "stats"
+
+    if cmd == "stats":
+        s = cache["stats"]
+        s["files"] = len(cache["files"])
+        s["fingerprint"] = cache["fingerprint"]
+        return s
+
+    if cmd == "functions":
+        funcs = []
+        for f in cache["files"]:
+            for fn in f.get("functions", []):
+                funcs.append({"name": fn.get("qualified_name", fn["name"]), "file": f["file"], "line": fn["line"]})
+        return sorted(funcs, key=lambda x: x["name"])
+
+    if cmd == "classes":
+        cls = []
+        for f in cache["files"]:
+            for c in f.get("classes", []):
+                cls.append({"name": c["name"], "bases": c.get("bases", []), "file": f["file"], "line": c["line"], "methods": c.get("methods", [])})
+        return sorted(cls, key=lambda x: x["name"])
+
+    if cmd == "calls" and len(args) > 1:
+        name = args[1]
+        # What does `name` call?
+        return cache["call_graph"].get(name, [])
+
+    if cmd == "callers" and len(args) > 1:
+        name = args[1]
+        # Who calls `name`?
+        return cache["reverse_graph"].get(name, [])
+
+    if cmd == "file" and len(args) > 1:
+        target = args[1]
+        for f in cache["files"]:
+            if f["file"] == target or f["file"].endswith(target):
+                return f
+        return {"error": f"file not found: {target}"}
+
+    if cmd == "imports":
+        return cache["import_graph"]
+
+    if cmd == "search" and len(args) > 1:
+        pattern = args[1].lower()
+        results = []
+        for f in cache["files"]:
+            for fn in f.get("functions", []):
+                if pattern in fn.get("qualified_name", fn["name"]).lower():
+                    results.append({"name": fn.get("qualified_name", fn["name"]), "file": f["file"], "line": fn["line"], "kind": "function"})
+            for c in f.get("classes", []):
+                if pattern in c["name"].lower():
+                    results.append({"name": c["name"], "file": f["file"], "line": c["line"], "kind": "class"})
+        return results
+
+    return {"error": f"unknown query: {cmd}", "available": ["stats", "functions", "classes", "calls <name>", "callers <name>", "file <path>", "imports", "search <pattern>"]}
+
+
+# ── Main ──
+
+def main():
+    args = sys.argv[1:]
+    if not args:
+        print(__doc__)
+        sys.exit(1)
+
+    project_dir = args[0]
+    excludes = set(DEFAULT_EXCLUDES)
+
+    # Parse flags
+    output_file = None
+    query_args = None
+    i = 1
+    while i < len(args):
+        if args[i] == "--output" and i + 1 < len(args):
+            output_file = args[i + 1]
+            i += 2
+        elif args[i] == "--exclude" and i + 1 < len(args):
+            excludes.add(args[i + 1])
+            i += 2
+        elif args[i] == "--query":
+            query_args = args[i + 1:]
+            break
+        else:
+            i += 1
+
+    # Check for cached data
+    if not output_file:
+        output_file = os.path.join(project_dir, ".code-graph.json")
+
+    if query_args and os.path.exists(output_file):
+        with open(output_file) as f:
+            cache = json.load(f)
+        result = query(cache, query_args)
+        print(json.dumps(result, indent=2))
+        return
+
+    # Build or rebuild
+    cache = scan_project(project_dir, excludes)
+
+    with open(output_file, "w") as f:
+        json.dump(cache, f, indent=2)
+
+    if query_args:
+        result = query(cache, query_args)
+        print(json.dumps(result, indent=2))
+    else:
+        print(json.dumps(cache["stats"], indent=2))
+        print(f"\nCache written to {output_file}")
+
+
+if __name__ == "__main__":
+    main()
