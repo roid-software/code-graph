@@ -199,11 +199,13 @@ def analyze_js(filepath: str, rel_path: str) -> dict:
 
     for m in _JS_FUNC.finditer(source):
         ln = source[:m.start()].count("\n") + 1
-        functions.append({"name": m.group(1), "qualified_name": m.group(1), "line": ln, "params_raw": m.group(2).strip()})
+        raw = m.group(2).strip()
+        clean = ", ".join(p.split("=")[0].split(":")[0].strip() for p in raw.split(",") if p.strip()) if raw else ""
+        functions.append({"name": m.group(1), "qualified_name": m.group(1), "line": ln, "params": clean})
 
     for m in _JS_ARROW.finditer(source):
         ln = source[:m.start()].count("\n") + 1
-        functions.append({"name": m.group(1), "qualified_name": m.group(1), "line": ln, "params_raw": ""})
+        functions.append({"name": m.group(1), "qualified_name": m.group(1), "line": ln, "params": ""})
 
     for m in _JS_CLASS.finditer(source):
         ln = source[:m.start()].count("\n") + 1
@@ -336,11 +338,15 @@ def analyze_rb(filepath: str, rel_path: str) -> dict:
             current_method = qualified
             method_stack.append(qualified)
             scope_stack.append("def")
+            # Strip default values from params to avoid leaking secrets
+            clean_params = ", ".join(
+                p.split("=")[0].strip() for p in params_raw.split(",") if p.strip()
+            ) if params_raw.strip() else ""
             functions.append({
                 "name": name,
                 "qualified_name": qualified,
                 "line": lineno,
-                "params_raw": params_raw.strip(),
+                "params": clean_params,
                 "is_class_method": is_class_method,
                 "class": current_class,
             })
